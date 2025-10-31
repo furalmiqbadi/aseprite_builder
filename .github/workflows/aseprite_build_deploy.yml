@@ -9,77 +9,77 @@ on:
         default: 'true'
   push:
     branches:
-      - master
       - main
+      - master
 
 env:
   BUILD_TYPE: Release
 
 jobs:
   build-aseprite:
-    name: Build Aseprite
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [windows-latest]  # fokus Windows dulu. Tambah ubuntu-latest, macos-latest kalau perlu
-      fail-fast: false
+    name: Build Aseprite (Windows)
+    runs-on: windows-latest
 
     steps:
-      - name: Checkout minimal repo (untuk artefak rilis)
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      # Skia cache
-      - name: Get Skia from cache
+      - name: Dapatkan info rilis Aseprite terbaru
+        id: latest
+        shell: powershell
+        run: |
+          $resp = Invoke-RestMethod -Uri "https://api.github.com/repos/aseprite/aseprite/releases/latest" -Headers @{ "Accept"="application/vnd.github+json" }
+          $tag = $resp.tag_name
+          $src = ($resp.assets | Where-Object { $_.name -like "*-Source.zip" }).browser_download_url
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "src=$src" >> $env:GITHUB_OUTPUT
+
+      - name: Cache Skia m124
         id: skia-cache
         uses: actions/cache@v4
         with:
           path: skia
           key: skia-${{ runner.os }}-m124
 
-      - name: Download Skia m124 jika belum ada
+      - name: Download & ekstrak Skia m124 (jika belum ada)
         if: steps.skia-cache.outputs.cache-hit != 'true'
-        shell: bash
+        shell: powershell
         run: |
-          case "${{ runner.os }}" in
-            Windows) SKIA_ZIP=Skia-Windows-Release-x64.zip ;;
-            Linux)   SKIA_ZIP=Skia-Linux-Release-x64.zip ;;
-            macOS)   SKIA_ZIP=Skia-macOS-Release-x64.zip ;;
-          esac
-          curl -L -o skia.zip https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/$SKIA_ZIP
-          mkdir -p skia
-          7z x skia.zip -oskia
-
-      # Ambil source Aseprite dari rilis terbaru (bisa dipaksa run manual tanpa nunggu rilis)
-      - name: Dapatkan info rilis terbaru
-        id: latest
-        shell: bash
-        run: |
-          data=$(curl -sL https://api.github.com/repos/aseprite/aseprite/releases/latest)
-          tag=$(echo "$data" | jq -r '.tag_name')
-          src=$(echo "$data" | jq -r '.assets[] | select(.name | endswith("-Source.zip")) | .browser_download_url')
-          echo "tag=$tag" >> $GITHUB_OUTPUT
-          echo "src=$src" >> $GITHUB_OUTPUT
+          $url = "https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-Windows-Release-x64.zip"
+          Invoke-WebRequest -Uri $url -OutFile skia.zip
+          if (Test-Path skia) { Remove-Item -Recurse -Force skia }
+          Expand-Archive -Path skia.zip -DestinationPath skia
 
       - name: Unduh source Aseprite
+        shell: powershell
         run: |
-          curl -L -o Aseprite-source.zip "${{ steps.latest.outputs.src }}"
-          mkdir -p aseprite
-          7z x Aseprite-source.zip -oaseprite
+          Invoke-WebRequest -Uri "${{ steps.latest.outputs.src }}" -OutFile Aseprite-source.zip
+          if (Test-Path aseprite) { Remove-Item -Recurse -Force aseprite }
+          New-Item -ItemType Directory -Path aseprite | Out-Null
+          Expand-Archive -Path Aseprite-source.zip -DestinationPath aseprite
 
-      # Siapkan toolchain Windows (VS 2022 + Ninja + CMake)
-      - name: Aktifkan VS 2022 env (x64)
-        if: runner.os == 'Windows'
+      - name: Install Ninja (manual)
+        shell: powershell
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/ninja-build/ninja/releases/download/v1.11.1/ninja-win.zip" -OutFile ninja.zip
+          Expand-Archive ninja.zip -DestinationPath $env:RUNNER_TEMP\ninja
+          "$env:RUNNER_TEMP\ninja" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          ninja --version
+
+      - name: Aktifkan Visual Studio 2022 (x64)
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      - name: Pasang Ninja
-        uses: seanmiddleditch/gha-setup-ninja@v1
+      - name: Siapkan folder build
+        shell: powershell
+        working-directory: aseprite
+        run: |
+          if (!(Test-Path build)) { New-Item -ItemType Directory -Path build | Out-Null }
 
-      - name: Konfigurasi CMake (Windows)
-        if: runner.os == 'Windows'
-        working-directory: aseprite/build
+      - name: Konfigurasi CMake (Ninja + Skia)
         shell: cmd
+        working-directory: aseprite/build
         run: >
           cmake -G Ninja
           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
@@ -93,22 +93,26 @@ jobs:
         working-directory: aseprite/build
         run: ninja aseprite
 
-      - name: Jadikan portable (buat aseprite.ini)
+      - name: Jadikan portable
         working-directory: aseprite/build/bin
-        shell: bash
-        run: echo '# portable' > aseprite.ini
+        shell: powershell
+        run: |
+          '# portable' | Out-File -FilePath aseprite.ini -Encoding utf8
 
       - name: Kemasi ZIP
-        working-directory: aseprite/build/bin
-        run: 7z a "Aseprite-${{ steps.latest.outputs.tag }}-${{ runner.os }}.zip" *
+        shell: powershell
+        run: |
+          $zipName = "Aseprite-${{ steps.latest.outputs.tag }}-Windows-x64.zip"
+          if (Test-Path $zipName) { Remove-Item $zipName -Force }
+          Compress-Archive -Path "aseprite/build/bin/*" -DestinationPath $zipName
 
-      - name: Buat Draft Release dan upload file
+      - name: Upload ke Draft Release
         uses: softprops/action-gh-release@v2
         with:
           draft: true
           tag_name: "aseprite-${{ steps.latest.outputs.tag }}-${{ github.run_id }}"
-          name: "Aseprite ${{ steps.latest.outputs.tag }} (${{ runner.os }})"
+          name: "Aseprite ${{ steps.latest.outputs.tag }} (Windows x64)"
           files: |
-            aseprite/build/bin/Aseprite-${{ steps.latest.outputs.tag }}-${{ runner.os }}.zip
+            Aseprite-${{ steps.latest.outputs.tag }}-Windows-x64.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
